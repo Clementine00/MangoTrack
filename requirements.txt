@@ -3,3 +3,4 @@
 # transitive deps when that starts to matter.
 fastapi==0.136.3
 uvicorn[standard]==0.48.0
+httpx==0.28.1
