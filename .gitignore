@@ -1,0 +1,14 @@
+# Python virtual environment — disposable, rebuilt from requirements.txt.
+# Never commit this: it's large, machine-specific, and not the source of truth.
+.venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Env / secrets — keep credentials out of version control
+.env
+
+# macOS
+.DS_Store

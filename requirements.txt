@@ -1,0 +1,5 @@
+# Pinned to the exact versions tested locally so Fly's from-scratch Docker
+# build installs the same bytes. Top-level pins for now; add a lockfile for
+# transitive deps when that starts to matter.
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
