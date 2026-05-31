@@ -1,0 +1,26 @@
+# Recipe for the container image Fly runs. Built from scratch on Fly's
+# builders, so the ONLY source of truth for dependencies is requirements.txt.
+
+# Start from a minimal official Python image matching the local 3.13.
+FROM python:3.13-slim
+
+# Work inside /app in the container.
+WORKDIR /app
+
+# Install deps FIRST, as their own cached layer. Editing main.py later won't
+# re-run pip. The pinned versions in requirements.txt make this build
+# reproducible: the exact fastapi/uvicorn/httpx tested locally get installed.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Now copy the application code.
+COPY . .
+
+# Document the port the app listens on (must match fly.toml internal_port).
+EXPOSE 8080
+
+# Production run command. Two deliberate differences from local dev:
+#   --host 0.0.0.0  — inside a container 127.0.0.1 is unreachable from Fly's
+#                     proxy; 0.0.0.0 accepts traffic on all interfaces.
+#   no --reload     — production code doesn't change under us.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,0 +1,13 @@
+# Keep these OUT of the image build context. The container builds its own
+# dependency environment from requirements.txt, so the local .venv is useless
+# (and huge) inside it. Same spirit as .gitignore, different audience.
+.venv/
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.DS_Store
+.dockerignore
+Dockerfile

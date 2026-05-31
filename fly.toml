@@ -1,0 +1,30 @@
+# Fly.io app configuration: how Fly runs the image the Dockerfile builds.
+# `app` must be globally unique on Fly — change it if "mangotrack" is taken.
+# `fly launch` can regenerate this; it's committed so deploys are reproducible.
+
+app = "mangotrack"
+primary_region = "sea"   # Seattle. Pick a region near you: fly platform regions
+
+[build]
+  # Use the Dockerfile in this directory (explicit; Fly would also auto-detect it).
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080      # MUST match the --port in the Dockerfile CMD.
+  force_https = true        # redirect http -> https
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0  # scale to zero when idle to save money
+
+  # Health check: Fly hits /health on a schedule and only routes traffic to
+  # machines that answer 200. This is the whole reason /health exists.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"          # plenty for this app; bump later if needed
