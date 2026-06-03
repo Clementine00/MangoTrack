@@ -1,0 +1,10 @@
+# Test-only dependencies. Kept OUT of requirements.txt so the production
+# Docker image never ships a test runner. Install locally with:
+#   pip install -r requirements-dev.txt
+#
+# The "-r requirements.txt" line pulls in the app's runtime deps too, so a
+# fresh dev/CI environment gets everything from this one file.
+-r requirements.txt
+
+pytest==9.0.3
+respx==0.23.1   # mocks httpx so tests never hit the real MangaDex API

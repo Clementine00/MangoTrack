@@ -11,3 +11,9 @@ __pycache__/
 .DS_Store
 .dockerignore
 Dockerfile
+
+# Tests and their tooling belong in CI, not in the production image. The
+# Dockerfile only installs requirements.txt, so these would ride along as
+# dead weight (pytest/respx aren't even present to run them).
+test_main.py
+requirements-dev.txt
