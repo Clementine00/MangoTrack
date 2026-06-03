@@ -1,0 +1,33 @@
+name: CI
+
+  # WHEN this runs. Two triggers:
+  #   - push: every push to any branch
+  #   - pull_request: when a PR targets main (so PRs get a green/red check)
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest        # the fresh VM GitHub gives us
+
+    steps:
+      # 1. Get our code onto the runner.
+      - uses: actions/checkout@v4
+
+      # 2. Put Python 3.13 on the runner (match our local + Docker version).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 3. Install app + test deps. requirements-dev.txt pulls in
+      #    requirements.txt via its "-r" line, so this one install
+      #    gets everything — and proves our pins work from scratch.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # 4. The whole point: run the suite. A non-zero exit fails the job.
+      - name: Run pytest
+        run: pytest -v
