@@ -30,6 +30,13 @@ def test_health():
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
 
+def test_version():
+    """/version reports a commit string — "dev" when GIT_SHA isn't set 
+  (local/test)."""
+    resp = client.get("/version")
+    assert resp.status_code == 200
+    assert resp.json() == {"commit": "dev"}
+
 
 @respx.mock
 def test_latest_happy_path():

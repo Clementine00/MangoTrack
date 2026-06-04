@@ -10,6 +10,7 @@ Endpoints:
 """
 
 import httpx
+import os
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="MangoTrack")
@@ -31,6 +32,16 @@ USER_AGENT = "MangoTrack/0.1 (https://github.com/Clementine00/MangoTrack; learni
 def health() -> dict[str, str]:
     """Liveness probe. 200 + {"status": "ok"} means the process can serve HTTP."""
     return {"status": "ok"}
+
+@app.get("/version")
+def version() -> dict[str, str]:
+    """Report the git commit this running image was built from.
+      
+      The SHA is baked in at build time (Dockerfile ARG -> ENV). Falls back to
+      "dev" for local runs and tests, so any running instance can tell you
+      exactly what code it's serving.
+      """
+    return {"commit": os.getenv("GIT_SHA", "dev")}
 
 
 @app.get("/latest")

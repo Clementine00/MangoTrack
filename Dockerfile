@@ -15,6 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Now copy the application code.
 COPY . .
+# Stamp the image with the git commit it was built from, so /version can
+# report exactly what's running. Defaults to "dev"; the pipeline overrides it
+# with --build-arg GIT_SHA=<commit>. Placed late on purpose — changing the SHA
+# only rebuilds these tiny layers, never the cached pip-install above.
+ARG GIT_SHA=dev
+ENV GIT_SHA=$GIT_SHA
 
 # Document the port the app listens on (must match fly.toml internal_port).
 EXPOSE 8080
