@@ -31,10 +31,13 @@ def test_health():
     assert resp.json() == {"status": "ok"}
 
 def test_version():
-    """/version reports a commit string — "dev" when GIT_SHA isn't set (local/test)."""
+    """/version reports version+commit+url, all falling back to "dev" locally."""
     resp = client.get("/version")
     assert resp.status_code == 200
-    assert resp.json() == {"commit": "dev"}
+    body = resp.json()
+    assert body["version"] == "dev"
+    assert body["commit"] == "dev"
+    assert body["url"].endswith("/commit/dev")
 
 
 @respx.mock

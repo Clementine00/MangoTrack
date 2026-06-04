@@ -27,6 +27,8 @@ TRACKED_MANGA_ID = "59ef045c-0712-4f15-bb54-52bffd87481b"
 # Being a good API citizen also makes our traffic debuggable on their side.
 USER_AGENT = "MangoTrack/0.1 (https://github.com/Clementine00/MangoTrack; learning project)"
 
+GITHUB_REPO = "https://github.com/Clementine00/MangoTrack"
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -36,13 +38,18 @@ def health() -> dict[str, str]:
 
 @app.get("/version")
 def version() -> dict[str, str]:
-    """Report the git commit this running image was built from.
-      
-    The SHA is baked in at build time (Dockerfile ARG -> ENV). Falls back to
-    "dev" for local runs and tests, so any running instance can tell you
-    exactly what code it's serving.
+    """Report what this running image is: release version, commit, and a link.
+
+    Both values are baked in at build time (Dockerfile ARG -> ENV) and fall
+    back to "dev" locally/in tests. `url` lets you click straight to the exact
+    commit on GitHub instead of eyeballing a hash against `git log`.
     """
-    return {"commit": os.getenv("GIT_SHA", "dev")}
+    sha = os.getenv("GIT_SHA", "dev")
+    return {
+        "version": os.getenv("APP_VERSION", "dev"),
+        "commit": sha[:7],
+        "url": f"{GITHUB_REPO}/commit/{sha}",
+    } 
 
 
 @app.get("/latest")
