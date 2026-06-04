@@ -33,10 +33,9 @@ jobs:
         run: pytest -v
   deploy:
       name: Deploy to Fly
-      needs: test                    #won't start unless `test` succeeded
-      # Only deploy on a real push to main — never on PRs or other branches.
+      needs: test                    # won't start unless `test` succeeded
       # Deploy on pushes to main (continuous) AND on version tags (named releases).
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' ||startsWith(github.ref, 'refs/tags/v'))
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
       runs-on: ubuntu-latest
 
       steps:
