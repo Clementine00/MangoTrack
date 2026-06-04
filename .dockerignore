@@ -11,6 +11,7 @@ __pycache__/
 .DS_Store
 .dockerignore
 Dockerfile
+mangotrack.db
 
 # Tests and their tooling belong in CI, not in the production image. The
 # Dockerfile only installs requirements.txt, so these would ride along as
