@@ -4,30 +4,29 @@ A starting point for learning devops, growing into a manga tracker that will
 eventually notify when new chapters drop.
 
 Endpoints:
-    /health             — liveness probe (is the process up and serving HTTP?)
+    /health             — liveness probe (process up and serving HTTP?)
+    /ready              — readiness probe (DB reachable + schema present?)
     /version            — what image is running: version, commit, link
-    /latest             — latest chapter for the one title we hardcode (Hitoner)
+    /latest             — latest chapter for the default title (Hitoner)
     /latest/{manga_id}  — latest chapter for any title, by MangaDex UUID
+    /track/{manga_id}   — start tracking a manga (POST); baseline = current latest
+    /track              — list tracked manga (GET)
 """
 import os
+import sqlite3
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, HTTPException
-
 from pydantic import BaseModel
-
-import sqlite3
-from contextlib import contextmanager, asynccontextmanager
-from datetime import datetime, timezone
-
 
 # --- MangaDex config -------------------------------------------------------
 MANGADEX_API = "https://api.mangadex.org"
 
-# Hardcoded for now: the single manga we're tracking ("Hitoner").
-# Next step once this works: make this a path parameter, e.g. /latest/{manga_id},
-# so MangoTrack can track any title.
+# The title the bare /latest route defaults to ("Hitoner").
+# /latest/{manga_id} lets callers track any title instead.
 TRACKED_MANGA_ID = "59ef045c-0712-4f15-bb54-52bffd87481b"
 
 # MangaDex asks API clients to identify themselves with a User-Agent.
@@ -36,20 +35,18 @@ USER_AGENT = "MangoTrack/0.1 (https://github.com/Clementine00/MangoTrack; learni
 
 GITHUB_REPO = "https://github.com/Clementine00/MangoTrack"
 
- # Local default; on Fly we'll point this at the mounted volume via env var.
+# Local default; on Fly we'll point this at the mounted volume via env var.
 DB_PATH = os.getenv("DB_PATH", "mangotrack.db")
 
 
+# --- database --------------------------------------------------------------
 @contextmanager
 def get_db():
     """Open a SQLite connection, commit on success, always close.
 
-    Connection-per-operation: sqlite3.connect is cheap, and this 
-avoids the
-    cross-thread headaches a single shared connection brings. 
-`row_factory`
-    makes rows accessible by column name (row["manga_id"]) instead 
-of by index.
+    Connection-per-operation: sqlite3.connect is cheap, and this avoids the
+    cross-thread headaches a single shared connection brings. `row_factory`
+    makes rows accessible by column name (row["manga_id"]) instead of by index.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -61,17 +58,17 @@ of by index.
 
 
 def init_db() -> None:
-      """Create the table if it's missing. Safe to run on every startup."""
-      with get_db() as conn:
-          conn.execute(
-              """
-              CREATE TABLE IF NOT EXISTS tracked_manga (
-                  manga_id          TEXT PRIMARY KEY,
-                  last_seen_chapter TEXT,
-                  last_checked_at   TEXT
-              )
-              """
-          )
+    """Create the table if it's missing. Safe to run on every startup."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_manga (
+                manga_id          TEXT PRIMARY KEY,
+                last_seen_chapter TEXT,
+                last_checked_at   TEXT
+            )
+            """
+        )
 
 
 @asynccontextmanager
@@ -84,32 +81,48 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MangoTrack", lifespan=lifespan)
 
 
-class TrackedManga(BaseModel):
-      manga_id: str
-      last_seen_chapter: str | None
-      last_checked_at: str | None
-
-
+# --- response models -------------------------------------------------------
 class LatestChapter(BaseModel):
-      """The shape of every /latest response — our 'departures 
-  manifest'.
+    """The shape of every /latest response — our 'departures manifest'.
 
-      manga_id and latest_chapter are always present; chapter_title 
-  and
-      published_at can be null (MangaDex doesn't always supply them, 
-  which is
-      why fetch_latest reads them with .get()).
-      """
-      manga_id: str
-      latest_chapter: str
-      chapter_title: str | None
-      published_at: str | None
+    manga_id and latest_chapter are always present; chapter_title and
+    published_at can be null (MangaDex doesn't always supply them, which is
+    why fetch_latest reads them with .get()).
+    """
+    manga_id: str
+    latest_chapter: str
+    chapter_title: str | None
+    published_at: str | None
 
 
+class TrackedManga(BaseModel):
+    manga_id: str
+    last_seen_chapter: str | None
+    last_checked_at: str | None
+
+
+# --- health -----------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Liveness probe. 200 + {"status": "ok"} means the process can serve HTTP."""
+    """Liveness: is THIS PROCESS up and serving HTTP? No dependency checks, on
+    purpose — if the DB were down, restarting the process wouldn't help, so
+    failing liveness on it would just cause a pointless restart loop.
+    """
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready() -> dict[str, str]:
+    """Readiness: can we actually do real work — i.e. is the DB reachable and the
+    schema present? If not, return 503 so the platform stops routing traffic here
+    (but does NOT restart us — we're alive, just not ready).
+    """
+    try:
+        with get_db() as conn:
+            conn.execute("SELECT 1 FROM tracked_manga LIMIT 1")
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"Database not ready: {exc}") from exc
+    return {"status": "ready"}
 
 
 @app.get("/version")
@@ -128,6 +141,7 @@ def version() -> dict[str, str]:
     }
 
 
+# --- latest (read) ----------------------------------------------------------
 async def fetch_latest(manga_id: str | UUID) -> LatestChapter:
     """Ask MangaDex for the latest English chapter of `manga_id`.
 
@@ -169,17 +183,17 @@ async def fetch_latest(manga_id: str | UUID) -> LatestChapter:
 
     chapter = data[0]["attributes"]
     return LatestChapter(
-          manga_id=str(manga_id),
-          latest_chapter=chapter["chapter"],
-          chapter_title=chapter.get("title"),
-          published_at=chapter.get("publishAt"),
-      )
+        manga_id=str(manga_id),
+        latest_chapter=chapter["chapter"],
+        chapter_title=chapter.get("title"),
+        published_at=chapter.get("publishAt"),
+    )
 
 
 @app.get("/latest")
 async def latest() -> LatestChapter:
-      """Convenience: latest chapter for the one title we hardcode (Hitoner)."""
-      return await fetch_latest(TRACKED_MANGA_ID)
+    """Convenience: latest chapter for the one title we hardcode (Hitoner)."""
+    return await fetch_latest(TRACKED_MANGA_ID)
 
 
 @app.get("/latest/{manga_id}")
@@ -192,24 +206,23 @@ async def latest_for(manga_id: UUID) -> LatestChapter:
     return await fetch_latest(manga_id)
 
 
+# --- track (write) ----------------------------------------------------------
 @app.post("/track/{manga_id}")
 async def track(manga_id: UUID) -> TrackedManga:
-    """Start tracking a manga. Baseline = its current latest 
-chapter, so we
-    only notify on chapters released *after* this point. 
-Idempotent: re-tracking
-    keeps the original baseline."""
-    latest = await fetch_latest(manga_id)          # reuse the readhelper; 404s if no chapters
+    """Start tracking a manga. Baseline = its current latest chapter, so we only
+    notify on chapters released *after* this point. Idempotent: re-tracking keeps
+    the original baseline.
+    """
+    latest = await fetch_latest(manga_id)          # reuse the read helper; 404s if no chapters
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO tracked_manga (manga_id, last_seen_chapter,
-last_checked_at)
+            INSERT INTO tracked_manga (manga_id, last_seen_chapter, last_checked_at)
             VALUES (?, ?, ?)
             ON CONFLICT(manga_id) DO NOTHING
             """,
-            (str(manga_id), latest.latest_chapter, now), 
+            (str(manga_id), latest.latest_chapter, now),
         )
         row = conn.execute(
             "SELECT manga_id, last_seen_chapter, last_checked_at FROM tracked_manga WHERE manga_id = ?",
@@ -224,8 +237,10 @@ last_checked_at)
 
 @app.get("/track")
 def list_tracked() -> list[TrackedManga]:
-    """List everything we're tracking. Plain `def` (not async) on 
-purpose — see note."""
+    """List everything we're tracking. Plain `def` (not async) on purpose: SQLite
+    calls block, and FastAPI runs sync endpoints in a threadpool so the blocking
+    read doesn't freeze the event loop.
+    """
     with get_db() as conn:
         rows = conn.execute(
             "SELECT manga_id, last_seen_chapter, last_checked_at FROM tracked_manga ORDER BY manga_id"
@@ -238,4 +253,3 @@ purpose — see note."""
         )
         for row in rows
     ]
-    

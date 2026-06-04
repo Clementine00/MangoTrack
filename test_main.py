@@ -231,3 +231,24 @@ def test_track_is_idempotent(db):
 
     assert resp.json()["last_seen_chapter"] == "42"    # ON CONFLICT DO NOTHING held the line
     assert len(client.get("/track").json()) == 1       # no duplicate row
+
+
+# --- liveness vs readiness -------------------------------------------------
+
+
+def test_ready_ok_when_db_reachable(db):
+    """DB up + schema present → 200 ready."""
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ready"}
+
+
+def test_ready_503_when_schema_missing(tmp_path, monkeypatch):
+    """Point at a fresh DB file but DON'T init_db → table missing → 503, not a crash.
+
+    No `db` fixture here on purpose: we *want* an uninitialized database so the
+    readiness query fails and we can prove it degrades to 503 gracefully.
+    """
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "empty.db"))
+    resp = client.get("/ready")
+    assert resp.status_code == 503
