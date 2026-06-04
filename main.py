@@ -49,7 +49,7 @@ def version() -> dict[str, str]:
         "version": os.getenv("APP_VERSION", "dev"),
         "commit": sha[:7],
         "url": f"{GITHUB_REPO}/commit/{sha}",
-    } 
+    }
 
 
 @app.get("/latest")
