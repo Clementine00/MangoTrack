@@ -4,11 +4,13 @@ A starting point for learning devops, growing into a manga tracker that will
 eventually notify when new chapters drop.
 
 Endpoints:
-  /health  — liveness probe (is the process up and serving HTTP?)
-  /latest  — calls the MangaDex API and returns the latest chapter number
-             for the one manga we're tracking.
+    /health             — liveness probe (is the process up and serving HTTP?)
+    /version            — what image is running: version, commit, link
+    /latest             — latest chapter for the one title we hardcode (Hitoner)
+    /latest/{manga_id}  — latest chapter for any title, by MangaDex UUID
 """
 import os
+from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -52,15 +54,17 @@ def version() -> dict[str, str]:
     }
 
 
-@app.get("/latest")
-async def latest() -> dict:
-    """Return the latest English chapter number for the tracked manga via MangaDex.
+async def fetch_latest(manga_id: str | UUID) -> dict:
+    """Ask MangaDex for the latest English chapter of `manga_id`.
 
-    This endpoint is `async` because it makes a *network call*. While we wait on
-    MangaDex, an async client frees the server to handle other requests instead
-    of blocking.
+    All the network call + error translation lives here so both /latest routes
+    share one implementation. `manga_id` may be a str (the hardcoded default) or
+    a UUID (from the path route); an f-string stringifies either the same way.
+
+    This is `async` because it makes a *network call*. While we wait on MangaDex,
+    an async client frees the server to handle other requests instead of blocking.
     """
-    url = f"{MANGADEX_API}/manga/{TRACKED_MANGA_ID}/feed"
+    url = f"{MANGADEX_API}/manga/{manga_id}/feed"
     params = {
         "translatedLanguage[]": "en",   # only English-translated chapters
         "order[chapter]": "desc",       # sort highest chapter number first
@@ -91,8 +95,27 @@ async def latest() -> dict:
 
     chapter = data[0]["attributes"]
     return {
-        "manga_id": TRACKED_MANGA_ID,
+        # str() so both routes emit a string id (a raw UUID also serializes, but
+        # this keeps the two routes' output — and the tests — identical).
+        "manga_id": str(manga_id),
         "latest_chapter": chapter["chapter"],   # NOTE: a string, e.g. "5", not a number
         "chapter_title": chapter.get("title"),
         "published_at": chapter.get("publishAt"),
     }
+
+
+@app.get("/latest")
+async def latest() -> dict:
+      """Convenience: latest chapter for the one title we hardcode (Hitoner)."""
+      return await fetch_latest(TRACKED_MANGA_ID)
+
+
+@app.get("/latest/{manga_id}")
+async def latest_for(manga_id: UUID) -> dict:
+    """Latest chapter for any title, by MangaDex UUID.
+
+    Typing `manga_id` as UUID means a malformed id 422s here *before* we ever
+    call MangaDex — the network request never leaves the process.
+    """
+    return await fetch_latest(manga_id)
+    
