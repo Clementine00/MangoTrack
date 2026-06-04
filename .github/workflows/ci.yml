@@ -31,3 +31,21 @@ jobs:
       # 4. The whole point: run the suite. A non-zero exit fails the job.
       - name: Run pytest
         run: pytest -v
+  deploy:
+      name: Deploy to Fly
+      needs: test                    #won't start unless `test` succeeded
+      # Only deploy on a real push to main — never on PRs or other branches.
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      runs-on: ubuntu-latest
+
+      steps:
+        - uses: actions/checkout@v4
+
+        # Install the `flyctl` CLI onto the runner.
+        - uses: superfly/flyctl-actions/setup-flyctl@master
+
+        # Build on Fly's remote builders and release. flyctl reads the token
+        # from the FLY_API_TOKEN env var to authenticate as our scoped deployer.
+        - run: flyctl deploy --remote-only
+          env:
+            FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
