@@ -101,3 +101,48 @@ def test_latest_timeout_returns_502():
     resp = client.get("/latest")
 
     assert resp.status_code == 502
+
+
+ # A second, valid-but-different UUID to prove the path id actually steers the call.
+OTHER_MANGA_ID = "11111111-1111-1111-1111-111111111111"
+OTHER_FEED_URL = f"{MANGADEX_API}/manga/{OTHER_MANGA_ID}/feed"
+
+
+@respx.mock
+def test_latest_by_id_routes_to_that_manga():
+    """The id in the path flows through to the matching MangaDex feed URL."""
+    route = respx.get(OTHER_FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "attributes": {
+                            "chapter": "7",
+                            "title": "Elsewhere",
+                            "publishAt": "2026-06-02T00:00:00+00:00",
+                        }
+                    }
+                ]
+            },
+        )
+    )
+
+    resp = client.get(f"/latest/{OTHER_MANGA_ID}")
+
+    assert route.called          # we hit the right upstream URL, not the default one
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["manga_id"] == OTHER_MANGA_ID
+    assert body["latest_chapter"] == "7"
+
+
+def test_latest_by_id_rejects_non_uuid():
+    """A malformed id is the caller's fault: 422 here, and no MangaDex call at 
+all.
+
+    No respx mock is needed precisely because nothing leaves the process —
+    FastAPI rejects it on the UUID type before latest_for() ever runs.
+    """
+    resp = client.get("/latest/banana")
+    assert resp.status_code == 422

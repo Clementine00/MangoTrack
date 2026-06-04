@@ -12,7 +12,8 @@ tracker that notifies you when new chapters drop.
 |------------|--------------|
 | `/health`  | Liveness probe — `200 {"status": "ok"}` if the process is serving HTTP. |
 | `/version` | Reports the running release: `{version, commit, url}` (the `url` links to the exact commit on GitHub). |
-| `/latest`  | Returns the latest English chapter for the tracked manga, fetched live from MangaDex. |
+| `/latest`  | Latest English chapter for the default tracked manga (Hitoner), fetched live from MangaDex. |
+| `/latest/{manga_id}` | Latest English chapter for any title, by MangaDex UUID. A malformed id returns `422` before any upstream call. |
 | `/docs`    | Auto-generated interactive API docs (Swagger UI). |
 
 ## Local development
