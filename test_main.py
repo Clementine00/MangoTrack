@@ -252,3 +252,117 @@ def test_ready_503_when_schema_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "empty.db"))
     resp = client.get("/ready")
     assert resp.status_code == 503
+
+
+# --- scheduled check -------------------------------------------------------
+
+CHECK_TOKEN = "test-secret"
+
+
+@pytest.fixture
+def check_auth(monkeypatch):
+    """Set a known CHECK_TOKEN for the test and return the matching auth header."""
+    monkeypatch.setattr(main, "CHECK_TOKEN", CHECK_TOKEN)
+    return {"Authorization": f"Bearer {CHECK_TOKEN}"}
+
+
+def test_is_newer():
+    """Chapter comparison is numeric, with a string-difference fallback."""
+    assert main.is_newer("43", "42") is True
+    assert main.is_newer("42", "42") is False
+    assert main.is_newer("41", "42") is False
+    assert main.is_newer("42.5", "42") is True       # decimals compare numerically
+    assert main.is_newer("10", "9") is True          # numeric, not lexical ("10" < "9")
+    assert main.is_newer("42", None) is True         # nothing stored yet → new
+    assert main.is_newer("extra", "42") is True      # non-numeric + different → new
+    assert main.is_newer("oneshot", "oneshot") is False  # non-numeric + same → not new
+
+
+def test_check_requires_secret(db):
+    """No token → 401, and fail-closed: CHECK_TOKEN is unset here."""
+    resp = client.post("/check")
+    assert resp.status_code == 401
+
+
+def test_check_rejects_wrong_token(db, check_auth):
+    """A token that doesn't match → 401."""
+    resp = client.post("/check", headers={"Authorization": "Bearer wrong"})
+    assert resp.status_code == 401
+
+
+@respx.mock
+def test_check_detects_new_chapter(db, check_auth):
+    """New chapter → baseline advances and a pending notification is recorded."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
+
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    resp = client.post("/check", headers=check_auth)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"checked": 1, "new": 1}
+    assert client.get("/track").json()[0]["last_seen_chapter"] == "50"   # baseline advanced
+    with main.get_db() as conn:
+        rows = conn.execute("SELECT chapter, delivered FROM notifications").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["chapter"] == "50"
+    assert rows[0]["delivered"] == 0                   # pending, for slice 2 to deliver
+
+
+@respx.mock
+def test_check_no_new_chapter(db, check_auth):
+    """Same chapter → nothing new, no notification row."""
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    resp = client.post("/check", headers=check_auth)
+    assert resp.json() == {"checked": 1, "new": 0}
+    with main.get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM notifications").fetchone()["c"]
+    assert count == 0
+
+
+@respx.mock
+def test_check_skips_failing_manga(db, check_auth):
+    """One title's MangaDex call failing doesn't sink the batch — the rest run."""
+    r1 = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    r2 = respx.get(OTHER_FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    client.post(f"/track/{TRACKED_MANGA_ID}")
+    client.post(f"/track/{OTHER_MANGA_ID}")
+
+    r1.mock(return_value=httpx.Response(500))          # this title's upstream breaks
+    r2.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "43", "title": None, "publishAt": None}}]},
+        )
+    )
+    resp = client.post("/check", headers=check_auth)
+
+    assert resp.status_code == 200                      # batch survived the failure
+    assert resp.json() == {"checked": 1, "new": 1}      # failing one skipped, healthy one processed
