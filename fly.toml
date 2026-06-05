@@ -6,6 +6,11 @@
 app = 'mangotrack'
 primary_region = 'sjc'
 
+# Tell the app to write its SQLite file onto the mounted volume (see [mounts]),
+# not the container's throwaway filesystem. Not secret, so plain [env] is fine.
+[env]
+  DB_PATH = '/data/mangotrack.db'
+
 [build]
   dockerfile = 'Dockerfile'
 
@@ -21,7 +26,13 @@ primary_region = 'sjc'
     timeout = '2s'
     grace_period = '5s'
     method = 'GET'
-    path = '/health'
+    path = '/ready'
+
+# Persistent disk. `source` MUST match the volume name you create with
+# `fly volumes create`; `destination` is where it mounts inside the container.
+[mounts]
+  source = 'mangotrack_data'
+  destination = '/data'
 
 [[vm]]
   size = 'shared-cpu-1x'

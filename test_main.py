@@ -12,9 +12,11 @@ Two ideas do all the work here:
 """
 
 import httpx
+import pytest
 import respx
 from fastapi.testclient import TestClient
 
+import main
 from main import MANGADEX_API, TRACKED_MANGA_ID, app
 
 client = TestClient(app)
@@ -146,3 +148,107 @@ all.
     """
     resp = client.get("/latest/banana")
     assert resp.status_code == 422
+
+
+# --- persistence: /track ---------------------------------------------------
+#
+# The DB tests run against a throwaway SQLite *file* (not :memory:): get_db()
+# opens a fresh connection per call, and every :memory: connection is its own
+# separate, empty database — so the table init_db() creates wouldn't be visible
+# to the next connection.
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    """Point the app at a throwaway SQLite file and create the schema.
+
+    monkeypatch swaps main.DB_PATH for this test only (get_db reads it at call
+    time, so the swap takes effect), then restores it. We call init_db()
+    explicitly because the module-level TestClient doesn't run the lifespan.
+    """
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "test.db"))
+    main.init_db()
+    yield
+
+
+def test_list_tracked_empty(db):
+    """Nothing tracked yet → empty list."""
+    assert client.get("/track").json() == []
+
+
+@respx.mock
+def test_track_creates_and_lists(db):
+    """POST /track captures the current chapter as a baseline and persists it."""
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "attributes": {
+                            "chapter": "42",
+                            "title": "The Big One",
+                            "publishAt": "2026-06-01T00:00:00+00:00",
+                        }
+                    }
+                ]
+            },
+        )
+    )
+
+    resp = client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["manga_id"] == TRACKED_MANGA_ID
+    assert body["last_seen_chapter"] == "42"      # baseline captured at track-time
+    assert body["last_checked_at"] is not None
+
+    listed = client.get("/track").json()
+    assert len(listed) == 1
+    assert listed[0]["manga_id"] == TRACKED_MANGA_ID
+
+
+@respx.mock
+def test_track_is_idempotent(db):
+    """Re-tracking must NOT reset the baseline or create a duplicate row."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
+
+    # MangaDex later reports 99, but re-tracking should keep the original baseline.
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "99", "title": None, "publishAt": None}}]},
+        )
+    )
+    resp = client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    assert resp.json()["last_seen_chapter"] == "42"    # ON CONFLICT DO NOTHING held the line
+    assert len(client.get("/track").json()) == 1       # no duplicate row
+
+
+# --- liveness vs readiness -------------------------------------------------
+
+
+def test_ready_ok_when_db_reachable(db):
+    """DB up + schema present → 200 ready."""
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ready"}
+
+
+def test_ready_503_when_schema_missing(tmp_path, monkeypatch):
+    """Point at a fresh DB file but DON'T init_db → table missing → 503, not a crash.
+
+    No `db` fixture here on purpose: we *want* an uninitialized database so the
+    readiness query fails and we can prove it degrades to 503 gracefully.
+    """
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "empty.db"))
+    resp = client.get("/ready")
+    assert resp.status_code == 503
