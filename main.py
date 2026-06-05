@@ -11,15 +11,17 @@ Endpoints:
     /latest/{manga_id}  — latest chapter for any title, by MangaDex UUID
     /track/{manga_id}   — start tracking a manga (POST); baseline = current latest
     /track              — list tracked manga (GET)
+    /check              — scheduled sweep for new chapters (POST, secret-gated)
 """
 import os
+import secrets
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 # --- MangaDex config -------------------------------------------------------
@@ -37,6 +39,11 @@ GITHUB_REPO = "https://github.com/Clementine00/MangoTrack"
 
 # Local default; on Fly we'll point this at the mounted volume via env var.
 DB_PATH = os.getenv("DB_PATH", "mangotrack.db")
+
+# Shared secret guarding POST /check. Unset locally/in tests means the endpoint
+# refuses every caller (fail closed). In prod it's a Fly secret + a GitHub
+# Actions secret, sent by the cron as `Authorization: Bearer <token>`.
+CHECK_TOKEN = os.getenv("CHECK_TOKEN", "")
 
 
 # --- database --------------------------------------------------------------
@@ -66,6 +73,19 @@ def init_db() -> None:
                 manga_id          TEXT PRIMARY KEY,
                 last_seen_chapter TEXT,
                 last_checked_at   TEXT
+            )
+            """
+        )
+        # Each detected new chapter becomes a pending notification row. Slice 1
+        # writes these (delivered=0); a later slice delivers them and flips the flag.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notifications (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                manga_id    TEXT NOT NULL,
+                chapter     TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                delivered   INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -253,3 +273,75 @@ def list_tracked() -> list[TrackedManga]:
         )
         for row in rows
     ]
+
+
+# --- scheduled check --------------------------------------------------------
+def is_newer(latest: str, stored: str | None) -> bool:
+    """True if `latest` is a newer chapter than `stored`.
+
+    Chapters are strings like "42" or "42.5", so compare numerically when both
+    parse as floats (string compare would rank "9" above "10"). Fall back to
+    "different string = new" for non-numeric chapters, so we never silently miss
+    a release we can't parse. Nothing stored yet → anything counts as new.
+    """
+    if stored is None:
+        return True
+    try:
+        return float(latest) > float(stored)
+    except ValueError:
+        return latest != stored
+
+
+def require_check_token(authorization: str = Header(default="")) -> None:
+    """Guard /check with a shared secret sent as `Authorization: Bearer <token>`.
+
+    `secrets.compare_digest` is a constant-time comparison (avoids leaking the
+    token via response timing). Fails closed: if CHECK_TOKEN is unset, no caller
+    can match, so the endpoint is locked rather than wide open.
+    """
+    expected = f"Bearer {CHECK_TOKEN}"
+    if not CHECK_TOKEN or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.post("/check")
+async def check(_: None = Depends(require_check_token)) -> dict[str, int]:
+    """Scheduled sweep: for each tracked manga, detect a newer latest chapter,
+    advance its baseline, and record a pending notification. Secret-gated and
+    triggered by an external cron whose HTTP request wakes the scaled-to-zero
+    machine. One title's MangaDex failure is skipped so it can't sink the batch.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        targets = conn.execute(
+            "SELECT manga_id, last_seen_chapter FROM tracked_manga"
+        ).fetchall()
+
+    checked = 0
+    new = 0
+    for target in targets:
+        manga_id = target["manga_id"]
+        try:
+            latest = await fetch_latest(manga_id)
+        except HTTPException:
+            # This title's upstream call failed (502/404); skip and keep sweeping.
+            continue
+        checked += 1
+        with get_db() as conn:
+            if is_newer(latest.latest_chapter, target["last_seen_chapter"]):
+                conn.execute(
+                    "UPDATE tracked_manga SET last_seen_chapter = ?, last_checked_at = ? WHERE manga_id = ?",
+                    (latest.latest_chapter, now, manga_id),
+                )
+                conn.execute(
+                    "INSERT INTO notifications (manga_id, chapter, detected_at, delivered) "
+                    "VALUES (?, ?, ?, 0)",
+                    (manga_id, latest.latest_chapter, now),
+                )
+                new += 1
+            else:
+                conn.execute(
+                    "UPDATE tracked_manga SET last_checked_at = ? WHERE manga_id = ?",
+                    (now, manga_id),
+                )
+    return {"checked": checked, "new": new}

@@ -1,0 +1,19 @@
+name: Scheduled chapter check
+
+# Wakes the scaled-to-zero app and runs POST /check, which sweeps every tracked
+# manga for new chapters. The cron can't reach the DB directly (SQLite lives on
+# the app's volume), so it works by hitting the HTTP endpoint, which auto-starts
+# the machine on Fly.
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours (UTC); GitHub cron is best-effort
+  workflow_dispatch:         # manual "Run workflow" button for testing
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /check
+        run: |
+          curl -fsS -X POST https://mangotrack.fly.dev/check \
+            -H "Authorization: Bearer ${{ secrets.CHECK_TOKEN }}"
