@@ -84,3 +84,7 @@ curl https://mangotrack.fly.dev/version
 ## Tech stack
 
 FastAPI · Uvicorn · httpx · pytest · respx · Docker · Fly.io · GitHub Actions
+
+
+## Dev notes
+Problem: Altering table in live prod DB causes issues. ALTER TABLE must only run once per update. I could just manually update DB as there are no clients but this isn't a solution when there is. Solution: user_version. Using user_version as a counter, I can update the counter when specific schema changes runs for the first time. Then using the updated counter, I can ensure that the query never runs again causing the conflict. Rule: Never edit, only append.
