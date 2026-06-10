@@ -171,6 +171,50 @@ def db(tmp_path, monkeypatch):
     yield
 
 
+def test_migrations_upgrade_pre_title_db(tmp_path, monkeypatch):
+    """A database created before the title column existed gains it on startup.
+
+    This rehearses prod: the real volume holds the original 3-column
+    tracked_manga with user_version still at its default of 0. The runner must
+    bring it up to date and record how far it got.
+    """
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "old.db"))
+
+    # Build the pre-migration schema by hand. This SQL is a historical
+    # artifact — it must stay the OLD 3-column shape even as MIGRATIONS grows.
+    with main.get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE tracked_manga (
+                manga_id          TEXT PRIMARY KEY,
+                last_seen_chapter TEXT,
+                last_checked_at   TEXT
+            )
+            """
+        )
+
+    main.init_db()
+
+    with main.get_db() as conn:
+        cols = [row["name"] for row in conn.execute("PRAGMA table_info(tracked_manga)")]
+        assert "title" in cols
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == len(main.MIGRATIONS)
+
+
+def test_init_db_is_safe_to_rerun(db):
+    """Every startup calls init_db(); a second run must not re-apply anything.
+
+    Regression test for the naive approach: an unconditional ALTER TABLE would
+    raise 'duplicate column name: title' on the second call.
+    """
+    main.init_db()  # the db fixture already ran it once; this is restart #2
+
+    with main.get_db() as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == len(main.MIGRATIONS)
+
+
 def test_list_tracked_empty(db):
     """Nothing tracked yet → empty list."""
     assert client.get("/track").json() == []
