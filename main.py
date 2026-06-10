@@ -64,31 +64,45 @@ def get_db():
         conn.close()
 
 
+# Each entry is one schema change, applied in order, exactly once per database.
+# The database remembers how many it has applied via PRAGMA user_version.
+# NEVER edit or reorder existing entries — only append. A database that has
+# already applied a step will never re-run it, so editing history only affects
+# fresh databases and silently diverges them from prod.
+MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS tracked_manga (
+        manga_id          TEXT PRIMARY KEY,
+        last_seen_chapter TEXT,
+        last_checked_at   TEXT
+    )
+    """,
+    # Each detected new chapter becomes a pending notification row. Slice 1
+    # writes these (delivered=0); a later slice delivers them and flips the flag.
+    """
+    CREATE TABLE IF NOT EXISTS notifications (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        manga_id    TEXT NOT NULL,
+        chapter     TEXT NOT NULL,
+        detected_at TEXT NOT NULL,
+        delivered   INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # Human-readable name for notifications, fetched once at /track time.
+    # Nullable: rows tracked before this column existed fall back to the id.
+    "ALTER TABLE tracked_manga ADD COLUMN title TEXT",
+]
+
+
 def init_db() -> None:
-    """Create the table if it's missing. Safe to run on every startup."""
+    """Apply any schema migrations this database hasn't seen yet."""
     with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tracked_manga (
-                manga_id          TEXT PRIMARY KEY,
-                last_seen_chapter TEXT,
-                last_checked_at   TEXT
-            )
-            """
-        )
-        # Each detected new chapter becomes a pending notification row. Slice 1
-        # writes these (delivered=0); a later slice delivers them and flips the flag.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notifications (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                manga_id    TEXT NOT NULL,
-                chapter     TEXT NOT NULL,
-                detected_at TEXT NOT NULL,
-                delivered   INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        for n, statement in enumerate(MIGRATIONS[version:], start=version + 1):
+            conn.execute(statement)
+            # PRAGMA doesn't accept ? placeholders; n is our own loop counter,
+            # never external input, so the f-string is safe here.
+            conn.execute(f"PRAGMA user_version = {n}")
 
 
 @asynccontextmanager
