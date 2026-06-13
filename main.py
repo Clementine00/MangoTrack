@@ -45,6 +45,12 @@ DB_PATH = os.getenv("DB_PATH", "mangotrack.db")
 # Actions secret, sent by the cron as `Authorization: Bearer <token>`.
 CHECK_TOKEN = os.getenv("CHECK_TOKEN", "")
 
+# ntfy push delivery. The base server is a constant; only the topic is secret
+# (on ntfy.sh the topic name IS the access control). NTFY_TOPIC unset means
+# delivery is skipped entirely (fail closed) — local/test runs never push.
+NTFY_URL = "https://ntfy.sh"
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
+
 
 # --- database --------------------------------------------------------------
 @contextmanager
@@ -350,12 +356,75 @@ def require_check_token(authorization: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def notify(title: str, message: str, click: str | None = None) -> bool:
+    """Push one notification to ntfy. Best-effort: returns True on success and
+    False on any failure, never raises — a delivery failure must not sink the
+    sweep, and the caller leaves the row undelivered so a later sweep retries.
+
+    Uses ntfy's JSON publish format (POST a body to the root URL) rather than
+    HTTP headers, because titles can be non-ASCII (e.g. Japanese) and header
+    values can't carry that; a JSON body is UTF-8 all the way through.
+    """
+    if not NTFY_TOPIC:
+        return False   # fail closed: no topic configured -> nothing to deliver to
+    payload = {"topic": NTFY_TOPIC, "title": title, "message": message}
+    if click:
+        payload["click"] = click
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
+            resp = await client.post(NTFY_URL, json=payload)
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        return False
+    return True
+
+
+async def deliver_pending() -> int:
+    """Drain undelivered notifications: push each to ntfy and flip delivered=1
+    only on a successful send. A failed push leaves the row at 0, so the next
+    /check sweep retries it for free. Returns how many were delivered this pass.
+
+    Joins to tracked_manga for the human-readable title (falling back to the id),
+    so the push reads "Hitoner — Chapter 50" rather than a bare UUID.
+    """
+    if not NTFY_TOPIC:
+        return 0
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT n.id, n.manga_id, n.chapter, t.title
+            FROM notifications n
+            LEFT JOIN tracked_manga t ON t.manga_id = n.manga_id
+            WHERE n.delivered = 0
+            ORDER BY n.id
+            """
+        ).fetchall()
+
+    delivered = 0
+    for row in rows:
+        title = row["title"] or row["manga_id"]
+        click = f"https://mangadex.org/title/{row['manga_id']}"
+        if await notify(title, f"Chapter {row['chapter']} is out", click):
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE notifications SET delivered = 1 WHERE id = ?",
+                    (row["id"],),
+                )
+            delivered += 1
+    return delivered
+
+
 @app.post("/check")
 async def check(_: None = Depends(require_check_token)) -> dict[str, int]:
     """Scheduled sweep: for each tracked manga, detect a newer latest chapter,
-    advance its baseline, and record a pending notification. Secret-gated and
-    triggered by an external cron whose HTTP request wakes the scaled-to-zero
-    machine. One title's MangaDex failure is skipped so it can't sink the batch.
+    advance its baseline, and record a pending notification — then drain any
+    undelivered notifications to ntfy. Secret-gated and triggered by an external
+    cron whose HTTP request wakes the scaled-to-zero machine. One title's
+    MangaDex failure is skipped so it can't sink the batch; the delivery pass
+    drains everything still pending (including pushes that failed last sweep).
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
@@ -390,4 +459,5 @@ async def check(_: None = Depends(require_check_token)) -> dict[str, int]:
                     "UPDATE tracked_manga SET last_checked_at = ? WHERE manga_id = ?",
                     (now, manga_id),
                 )
-    return {"checked": checked, "new": new}
+    delivered = await deliver_pending()
+    return {"checked": checked, "new": new, "delivered": delivered}
