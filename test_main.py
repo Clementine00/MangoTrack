@@ -25,6 +25,15 @@ client = TestClient(app)
 # query string, so we don't have to restate the params here.
 FEED_URL = f"{MANGADEX_API}/manga/{TRACKED_MANGA_ID}/feed"
 
+# /track also fetches the manga's display name from the manga record (NOT /feed).
+# respx matches the full path, so this route is distinct from FEED_URL above.
+MANGA_URL = f"{MANGADEX_API}/manga/{TRACKED_MANGA_ID}"
+
+
+def _manga_title_response(title_dict):
+    """A MangaDex /manga/{id} body whose attributes.title is `title_dict`."""
+    return httpx.Response(200, json={"data": {"attributes": {"title": title_dict}}})
+
 
 def test_health():
     """The liveness probe is pure and makes no network call — easiest baseline."""
@@ -108,6 +117,7 @@ def test_latest_timeout_returns_502():
  # A second, valid-but-different UUID to prove the path id actually steers the call.
 OTHER_MANGA_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_FEED_URL = f"{MANGADEX_API}/manga/{OTHER_MANGA_ID}/feed"
+OTHER_MANGA_URL = f"{MANGADEX_API}/manga/{OTHER_MANGA_ID}"
 
 
 @respx.mock
@@ -239,6 +249,7 @@ def test_track_creates_and_lists(db):
             },
         )
     )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
 
     resp = client.post(f"/track/{TRACKED_MANGA_ID}")
 
@@ -247,10 +258,12 @@ def test_track_creates_and_lists(db):
     assert body["manga_id"] == TRACKED_MANGA_ID
     assert body["last_seen_chapter"] == "42"      # baseline captured at track-time
     assert body["last_checked_at"] is not None
+    assert body["title"] == "Hitoner"             # display name fetched at track-time
 
     listed = client.get("/track").json()
     assert len(listed) == 1
     assert listed[0]["manga_id"] == TRACKED_MANGA_ID
+    assert listed[0]["title"] == "Hitoner"
 
 
 @respx.mock
@@ -262,6 +275,7 @@ def test_track_is_idempotent(db):
             json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
         )
     )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
     client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
 
     # MangaDex later reports 99, but re-tracking should keep the original baseline.
@@ -275,6 +289,44 @@ def test_track_is_idempotent(db):
 
     assert resp.json()["last_seen_chapter"] == "42"    # ON CONFLICT DO NOTHING held the line
     assert len(client.get("/track").json()) == 1       # no duplicate row
+
+
+@respx.mock
+def test_track_title_falls_back_when_no_english(db):
+    """No "en" key → use the first localized title we do have."""
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"ja": "ヒトナー"}))
+
+    resp = client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    assert resp.json()["title"] == "ヒトナー"
+
+
+@respx.mock
+def test_track_title_is_best_effort(db):
+    """The title lookup failing must NOT break /track: it succeeds, title → id.
+
+    The baseline still comes from the feed; only the (best-effort) name is
+    missing, so the response falls back to the manga id.
+    """
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=httpx.Response(500))   # name lookup breaks
+
+    resp = client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    assert resp.status_code == 200                  # tracking still works
+    assert resp.json()["last_seen_chapter"] == "42"
+    assert resp.json()["title"] == TRACKED_MANGA_ID  # untitled → falls back to the id
 
 
 # --- liveness vs readiness -------------------------------------------------
@@ -343,6 +395,7 @@ def test_check_detects_new_chapter(db, check_auth):
             json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
         )
     )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
     client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
 
     route.mock(
@@ -372,6 +425,7 @@ def test_check_no_new_chapter(db, check_auth):
             json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
         )
     )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
     client.post(f"/track/{TRACKED_MANGA_ID}")
 
     resp = client.post("/check", headers=check_auth)
@@ -396,6 +450,8 @@ def test_check_skips_failing_manga(db, check_auth):
             json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
         )
     )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    respx.get(OTHER_MANGA_URL).mock(return_value=_manga_title_response({"en": "Elsewhere"}))
     client.post(f"/track/{TRACKED_MANGA_ID}")
     client.post(f"/track/{OTHER_MANGA_ID}")
 

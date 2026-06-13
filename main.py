@@ -133,6 +133,7 @@ class TrackedManga(BaseModel):
     manga_id: str
     last_seen_chapter: str | None
     last_checked_at: str | None
+    title: str | None
 
 
 # --- health -----------------------------------------------------------------
@@ -240,6 +241,34 @@ async def latest_for(manga_id: UUID) -> LatestChapter:
     return await fetch_latest(manga_id)
 
 
+async def fetch_manga_title(manga_id: str | UUID) -> str | None:
+    """Fetch a manga's display name from MangaDex, best-effort.
+
+    Hits /manga/{id} (the manga's own record) — NOT /feed, which only carries
+    chapters; the manga's name lives nowhere in the feed. The name comes back as
+    a localization dict ({"en": "Hitoner", ...}), so we pick a language out of
+    it: English if present, else whatever's there. Returns None on any failure
+    (network, bad status, or unexpected shape) so a missing title degrades to the
+    id at read-time instead of breaking /track.
+    """
+    url = f"{MANGADEX_API}/manga/{manga_id}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+
+    titles = resp.json().get("data", {}).get("attributes", {}).get("title", {})
+    if not isinstance(titles, dict):
+        return None
+    # Prefer English; fall back to the first localized title; None if there's none.
+    return titles.get("en") or next(iter(titles.values()), None)
+
+
 # --- track (write) ----------------------------------------------------------
 @app.post("/track/{manga_id}")
 async def track(manga_id: UUID) -> TrackedManga:
@@ -248,24 +277,26 @@ async def track(manga_id: UUID) -> TrackedManga:
     the original baseline.
     """
     latest = await fetch_latest(manga_id)          # reuse the read helper; 404s if no chapters
+    title = await fetch_manga_title(manga_id)       # best-effort; None if MangaDex won't say
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO tracked_manga (manga_id, last_seen_chapter, last_checked_at)
-            VALUES (?, ?, ?)
+            INSERT INTO tracked_manga (manga_id, last_seen_chapter, last_checked_at, title)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(manga_id) DO NOTHING
             """,
-            (str(manga_id), latest.latest_chapter, now),
+            (str(manga_id), latest.latest_chapter, now, title),
         )
         row = conn.execute(
-            "SELECT manga_id, last_seen_chapter, last_checked_at FROM tracked_manga WHERE manga_id = ?",
+            "SELECT manga_id, last_seen_chapter, last_checked_at, title FROM tracked_manga WHERE manga_id = ?",
             (str(manga_id),),
         ).fetchone()
     return TrackedManga(
         manga_id=row["manga_id"],
         last_seen_chapter=row["last_seen_chapter"],
         last_checked_at=row["last_checked_at"],
+        title=row["title"] or row["manga_id"],     # fall back to the id if untitled
     )
 
 
@@ -277,13 +308,14 @@ def list_tracked() -> list[TrackedManga]:
     """
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT manga_id, last_seen_chapter, last_checked_at FROM tracked_manga ORDER BY manga_id"
+            "SELECT manga_id, last_seen_chapter, last_checked_at, title FROM tracked_manga ORDER BY manga_id"
         ).fetchall()
     return [
         TrackedManga(
             manga_id=row["manga_id"],
             last_seen_chapter=row["last_seen_chapter"],
             last_checked_at=row["last_checked_at"],
+            title=row["title"] or row["manga_id"],     # fall back to the id if untitled
         )
         for row in rows
     ]
