@@ -11,13 +11,15 @@ Two ideas do all the work here:
    happens to be newest today).
 """
 
+import json
+
 import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
 
 import main
-from main import MANGADEX_API, TRACKED_MANGA_ID, app
+from main import MANGADEX_API, NTFY_URL, TRACKED_MANGA_ID, app
 
 client = TestClient(app)
 
@@ -362,6 +364,13 @@ def check_auth(monkeypatch):
     return {"Authorization": f"Bearer {CHECK_TOKEN}"}
 
 
+@pytest.fixture
+def ntfy_topic(monkeypatch):
+    """Configure a topic so delivery is enabled. Without this fixture NTFY_TOPIC
+    is "" (fail-closed), so /check detects but never pushes."""
+    monkeypatch.setattr(main, "NTFY_TOPIC", "test-topic")
+
+
 def test_is_newer():
     """Chapter comparison is numeric, with a string-difference fallback."""
     assert main.is_newer("43", "42") is True
@@ -407,7 +416,7 @@ def test_check_detects_new_chapter(db, check_auth):
     resp = client.post("/check", headers=check_auth)
 
     assert resp.status_code == 200
-    assert resp.json() == {"checked": 1, "new": 1}
+    assert resp.json() == {"checked": 1, "new": 1, "delivered": 0}       # no topic -> not pushed
     assert client.get("/track").json()[0]["last_seen_chapter"] == "50"   # baseline advanced
     with main.get_db() as conn:
         rows = conn.execute("SELECT chapter, delivered FROM notifications").fetchall()
@@ -429,7 +438,7 @@ def test_check_no_new_chapter(db, check_auth):
     client.post(f"/track/{TRACKED_MANGA_ID}")
 
     resp = client.post("/check", headers=check_auth)
-    assert resp.json() == {"checked": 1, "new": 0}
+    assert resp.json() == {"checked": 1, "new": 0, "delivered": 0}
     with main.get_db() as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM notifications").fetchone()["c"]
     assert count == 0
@@ -465,4 +474,73 @@ def test_check_skips_failing_manga(db, check_auth):
     resp = client.post("/check", headers=check_auth)
 
     assert resp.status_code == 200                      # batch survived the failure
-    assert resp.json() == {"checked": 1, "new": 1}      # failing one skipped, healthy one processed
+    assert resp.json() == {"checked": 1, "new": 1, "delivered": 0}  # failing one skipped, healthy one processed
+
+
+# --- notification delivery (ntfy) ------------------------------------------
+
+
+@respx.mock
+def test_check_delivers_to_ntfy(db, check_auth, ntfy_topic):
+    """A detected chapter is pushed to ntfy and its row flips to delivered=1."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
+
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    push = respx.post(NTFY_URL).mock(return_value=httpx.Response(200, json={}))
+
+    resp = client.post("/check", headers=check_auth)
+
+    assert resp.json() == {"checked": 1, "new": 1, "delivered": 1}
+    assert push.called
+    sent = json.loads(push.calls.last.request.content)
+    assert sent["topic"] == "test-topic"
+    assert sent["title"] == "Hitoner"                  # human-readable name, not the id
+    assert "50" in sent["message"]                     # the new chapter number
+    with main.get_db() as conn:
+        delivered = conn.execute("SELECT delivered FROM notifications").fetchone()["delivered"]
+    assert delivered == 1
+
+
+@respx.mock
+def test_check_delivery_failure_retries_next_sweep(db, check_auth, ntfy_topic):
+    """A failed push leaves the row at delivered=0; a later sweep drains it."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    push = respx.post(NTFY_URL).mock(return_value=httpx.Response(500))   # ntfy is down
+
+    resp = client.post("/check", headers=check_auth)
+    assert resp.json() == {"checked": 1, "new": 1, "delivered": 0}       # detected, not delivered
+    with main.get_db() as conn:
+        assert conn.execute("SELECT delivered FROM notifications").fetchone()["delivered"] == 0
+
+    # Next sweep: no new chapter, but ntfy recovers and the pending row drains.
+    push.mock(return_value=httpx.Response(200, json={}))
+    resp = client.post("/check", headers=check_auth)
+    assert resp.json() == {"checked": 1, "new": 0, "delivered": 1}       # retried successfully
+    with main.get_db() as conn:
+        assert conn.execute("SELECT delivered FROM notifications").fetchone()["delivered"] == 1
