@@ -12,6 +12,8 @@ Two ideas do all the work here:
 """
 
 import json
+import logging
+import uuid
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from fastapi.testclient import TestClient
 
 import main
 from main import MANGADEX_API, NTFY_URL, TRACKED_MANGA_ID, app
+from logging_setup import JsonFormatter, RequestIdFilter, request_id_var
 
 client = TestClient(app)
 
@@ -608,3 +611,62 @@ def test_check_delivery_failure_retries_next_sweep(db, check_auth, ntfy_topic):
     assert resp.json() == {"checked": 1, "new": 0, "delivered": 1}       # retried successfully
     with main.get_db() as conn:
         assert conn.execute("SELECT delivered FROM notifications").fetchone()["delivered"] == 1
+
+
+# --- structured logging ----------------------------------------------------
+
+
+def _record(msg="hi", name="mangotrack.test", level=logging.INFO, **extra):
+    """Build a LogRecord, optionally with extra={} fields set as attributes."""
+    rec = logging.LogRecord(name, level, __file__, 0, msg, None, None)
+    for key, value in extra.items():
+        setattr(rec, key, value)
+    return rec
+
+
+def test_json_formatter_includes_standard_and_extra_fields():
+    """The formatter emits the standard fields AND lifts extra={} into top-level keys."""
+    out = json.loads(JsonFormatter().format(_record("check done", checked=3, new=1)))
+
+    assert out["level"] == "INFO"
+    assert out["logger"] == "mangotrack.test"
+    assert out["msg"] == "check done"
+    assert out["checked"] == 3 and out["new"] == 1     # structured fields became real keys
+    assert "time" in out
+
+
+def test_json_formatter_stringifies_non_serializable_values():
+    """A non-JSON value (e.g. UUID) must stringify, not raise — logging can't crash."""
+    uid = uuid.uuid4()
+    out = json.loads(JsonFormatter().format(_record(manga_id=uid)))
+    assert out["manga_id"] == str(uid)
+
+
+def test_request_id_filter_stamps_record_from_contextvar():
+    """The filter copies the current request id onto the record (correlation)."""
+    token = request_id_var.set("abc12345")
+    try:
+        rec = _record()
+        assert RequestIdFilter().filter(rec) is True   # never drops the record
+        assert rec.request_id == "abc12345"
+    finally:
+        request_id_var.reset(token)
+
+
+def test_request_id_defaults_to_dash_outside_a_request():
+    """Outside any request the contextvar's default applies, so logs still parse."""
+    rec = _record()
+    RequestIdFilter().filter(rec)
+    assert rec.request_id == "-"
+
+
+def test_response_carries_request_id_header():
+    """The middleware mints a per-request id and returns it as X-Request-ID."""
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    request_id = resp.headers.get("X-Request-ID")
+    assert request_id is not None and len(request_id) == 8
+
+    # A second request gets a different id (ids are per-request, not constant).
+    other = client.get("/health").headers["X-Request-ID"]
+    assert other != request_id
