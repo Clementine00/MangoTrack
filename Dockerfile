@@ -36,4 +36,7 @@ EXPOSE 8080
 #   --host 0.0.0.0  — inside a container 127.0.0.1 is unreachable from Fly's
 #                     proxy; 0.0.0.0 accepts traffic on all interfaces.
 #   no --reload     — production code doesn't change under us.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# --no-access-log: our HTTP middleware already logs each request as JSON (with
+# duration + request_id), so uvicorn's plaintext access line would be redundant.
+# Startup/error logs from uvicorn are unaffected.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

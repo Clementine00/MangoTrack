@@ -14,16 +14,24 @@ Endpoints:
     /track              — list tracked manga (GET)
     /check              — scheduled sweep for new chapters + notification delivery (POST, secret-gated)
 """
+import logging
 import os
 import secrets
 import sqlite3
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
+
+from logging_setup import request_id_var, setup_logging
+
+# App logger. Children (mangotrack.check, ...) propagate up to the root handler
+# configured in setup_logging(), so everything comes out as one JSON stream.
+log = logging.getLogger("mangotrack")
 
 # --- MangaDex config -------------------------------------------------------
 MANGADEX_API = "https://api.mangadex.org"
@@ -114,12 +122,46 @@ def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()      # runs once, when the app boots
-    yield          # app serves requests here
+    setup_logging()   # configure log delivery before anything logs
+    init_db()         # runs once, when the app boots
+    yield             # app serves requests here
     # (nothing to tear down for SQLite)
 
 
 app = FastAPI(title="MangoTrack", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Assign each request an id, time it, and log one completion line.
+
+    Setting request_id_var here means every log emitted *during* this request —
+    the semantic ones inside endpoints too — is stamped with the same id, so a
+    whole request's lines can be grepped together. Health/readiness pings are the
+    cron's noise, so we skip logging them (they still get an id, harmlessly).
+    """
+    request_id = uuid4().hex[:8]
+    token = request_id_var.set(request_id)
+    start = time.perf_counter()
+    status = 500   # if call_next raises, we still log a 500 before re-raising
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = request_id   # let clients correlate too
+        return response
+    finally:
+        if request.url.path not in ("/health", "/ready"):
+            duration_ms = round((time.perf_counter() - start) * 1000, 1)
+            log.info(
+                "request",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": status,
+                    "duration_ms": duration_ms,
+                },
+            )
+        request_id_var.reset(token)
 
 
 # --- response models -------------------------------------------------------
@@ -213,6 +255,10 @@ async def fetch_latest(manga_id: str | UUID) -> LatestChapter:
     except httpx.HTTPError as exc:
         # The service we depend on failed (network error, timeout, or bad status).
         # 502 Bad Gateway is the honest signal: *we're* fine, the upstream isn't.
+        log.warning(
+            "mangadex request failed",
+            extra={"manga_id": str(manga_id), "error": str(exc)},
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Could not reach MangaDex: {exc}",
@@ -299,6 +345,10 @@ async def track(manga_id: UUID) -> TrackedManga:
             "SELECT manga_id, last_seen_chapter, last_checked_at, title FROM tracked_manga WHERE manga_id = ?",
             (str(manga_id),),
         ).fetchone()
+    log.info(
+        "manga tracked",
+        extra={"manga_id": str(manga_id), "title": title, "baseline": row["last_seen_chapter"]},
+    )
     return TrackedManga(
         manga_id=row["manga_id"],
         last_seen_chapter=row["last_seen_chapter"],
@@ -345,6 +395,10 @@ def untrack(manga_id: UUID) -> dict[str, str | int]:
         removed = conn.execute(
             "DELETE FROM notifications WHERE manga_id = ?", (str(manga_id),)
         ).rowcount
+    log.info(
+        "manga untracked",
+        extra={"manga_id": str(manga_id), "notifications_removed": removed},
+    )
     return {"manga_id": str(manga_id), "notifications_removed": removed}
 
 
@@ -435,6 +489,15 @@ async def deliver_pending() -> int:
                     (row["id"],),
                 )
             delivered += 1
+            log.info(
+                "notification delivered",
+                extra={"manga_id": row["manga_id"], "chapter": row["chapter"]},
+            )
+        else:
+            log.warning(
+                "notification delivery failed",
+                extra={"manga_id": row["manga_id"], "chapter": row["chapter"]},
+            )
     return delivered
 
 
@@ -475,10 +538,19 @@ async def check(_: None = Depends(require_check_token)) -> dict[str, int]:
                     (manga_id, latest.latest_chapter, now),
                 )
                 new += 1
+                log.info(
+                    "new chapter detected",
+                    extra={
+                        "manga_id": manga_id,
+                        "chapter": latest.latest_chapter,
+                        "previous": target["last_seen_chapter"],
+                    },
+                )
             else:
                 conn.execute(
                     "UPDATE tracked_manga SET last_checked_at = ? WHERE manga_id = ?",
                     (now, manga_id),
                 )
     delivered = await deliver_pending()
+    log.info("check complete", extra={"checked": checked, "new": new, "delivered": delivered})
     return {"checked": checked, "new": new, "delivered": delivered}
