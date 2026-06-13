@@ -1,8 +1,8 @@
 # MangoTrack 🥭
 
-A small FastAPI service that tracks manga chapters via the [MangaDex API](https://api.mangadex.org).
-It's a hands-on project for learning devops, growing toward a real product: a manga
-tracker that notifies you when new chapters drop.
+A small FastAPI service that tracks manga chapters via the [MangaDex API](https://api.mangadex.org)
+and notifies you (via [ntfy](https://ntfy.sh)) when new chapters drop. It's a hands-on
+project for learning devops.
 
 **Live:** https://mangotrack.fly.dev
 
@@ -10,11 +10,32 @@ tracker that notifies you when new chapters drop.
 
 | Endpoint   | What it does |
 |------------|--------------|
-| `/health`  | Liveness probe — `200 {"status": "ok"}` if the process is serving HTTP. |
-| `/version` | Reports the running release: `{version, commit, url}` (the `url` links to the exact commit on GitHub). |
-| `/latest`  | Latest English chapter for the default tracked manga (Hitoner), fetched live from MangaDex. |
-| `/latest/{manga_id}` | Latest English chapter for any title, by MangaDex UUID. A malformed id returns `422` before any upstream call. |
-| `/docs`    | Auto-generated interactive API docs (Swagger UI). |
+| `GET /health`  | Liveness probe — `200 {"status": "ok"}` if the process is serving HTTP. |
+| `GET /ready`   | Readiness probe — `200` if the DB is reachable and the schema is present, else `503` (alive but not ready to serve). |
+| `GET /version` | Reports the running release: `{version, commit, url}` (the `url` links to the exact commit on GitHub). |
+| `GET /latest`  | Latest English chapter for the default tracked manga (Hitoner), fetched live from MangaDex. |
+| `GET /latest/{manga_id}` | Latest English chapter for any title, by MangaDex UUID. A malformed id returns `422` before any upstream call. |
+| `POST /track/{manga_id}` | Start tracking a manga. Baselines it at the current latest chapter (so you're only notified about *future* releases) and fetches its title from MangaDex. Idempotent. |
+| `GET /track`   | List everything currently tracked. |
+| `DELETE /track/{manga_id}` | Stop tracking a manga and forget its pending notifications. `404` if it wasn't tracked. |
+| `POST /check`  | Sweep every tracked manga for new chapters, queue a notification per new chapter, and deliver pending ones. Secret-gated (`Authorization: Bearer <token>`), fail-closed. See below. |
+| `GET /docs`    | Auto-generated interactive API docs (Swagger UI). |
+
+## Notifications
+
+When `/check` finds a chapter newer than a manga's stored baseline, it records a
+notification and pushes it to your phone via [ntfy](https://ntfy.sh) — title,
+chapter, and a tap-through link to MangaDex.
+
+- **Scheduled, not manual.** A GitHub Actions cron (`.github/workflows/check.yml`)
+  hits `POST /check` every 2 hours, which also wakes the scaled-to-zero machine.
+  The workflow has a manual `workflow_dispatch` trigger for on-demand sweeps.
+- **Decoupled detect/deliver.** Detection queues notifications; delivery drains
+  the queue and only marks a row delivered on a *successful* push, so a failed
+  send simply retries on the next sweep.
+- **Fail-closed config.** `CHECK_TOKEN` guards `/check`; `NTFY_TOPIC` is the ntfy
+  destination. Both are Fly secrets — unset means the feature does nothing rather
+  than misfiring, so local/test runs never push.
 
 ## Local development
 
