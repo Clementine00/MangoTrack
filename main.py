@@ -10,8 +10,9 @@ Endpoints:
     /latest             — latest chapter for the default title (Hitoner)
     /latest/{manga_id}  — latest chapter for any title, by MangaDex UUID
     /track/{manga_id}   — start tracking a manga (POST); baseline = current latest
+    /track/{manga_id}   — stop tracking a manga (DELETE); also forgets its notifications
     /track              — list tracked manga (GET)
-    /check              — scheduled sweep for new chapters (POST, secret-gated)
+    /check              — scheduled sweep for new chapters + notification delivery (POST, secret-gated)
 """
 import os
 import secrets
@@ -325,6 +326,26 @@ def list_tracked() -> list[TrackedManga]:
         )
         for row in rows
     ]
+
+
+@app.delete("/track/{manga_id}")
+def untrack(manga_id: UUID) -> dict[str, str | int]:
+    """Stop tracking a manga and forget it. 404 if it wasn't tracked, so a
+    typo'd id surfaces instead of silently succeeding.
+
+    Also deletes the manga's notifications — both as cleanup and to avoid a real
+    bug: deliver_pending LEFT JOINs tracked_manga, so an untracked manga's
+    still-pending (delivered=0) notifications would otherwise get pushed on the
+    next sweep. Both deletes share one transaction (get_db commits on exit).
+    """
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM tracked_manga WHERE manga_id = ?", (str(manga_id),))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Not tracking this manga")
+        removed = conn.execute(
+            "DELETE FROM notifications WHERE manga_id = ?", (str(manga_id),)
+        ).rowcount
+    return {"manga_id": str(manga_id), "notifications_removed": removed}
 
 
 # --- scheduled check --------------------------------------------------------

@@ -331,6 +331,70 @@ def test_track_title_is_best_effort(db):
     assert resp.json()["title"] == TRACKED_MANGA_ID  # untitled → falls back to the id
 
 
+# --- untrack (delete) ------------------------------------------------------
+
+
+@respx.mock
+def test_untrack_removes_manga(db):
+    """DELETE /track/{id} stops tracking: the manga drops out of GET /track."""
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")
+    assert len(client.get("/track").json()) == 1
+
+    resp = client.delete(f"/track/{TRACKED_MANGA_ID}")
+
+    assert resp.status_code == 200
+    assert resp.json()["manga_id"] == TRACKED_MANGA_ID
+    assert client.get("/track").json() == []
+
+
+def test_untrack_unknown_manga_404(db):
+    """Deleting a manga we're not tracking is an honest 404, not a silent no-op."""
+    resp = client.delete(f"/track/{TRACKED_MANGA_ID}")
+    assert resp.status_code == 404
+
+
+@respx.mock
+def test_untrack_removes_pending_notifications(db, check_auth, ntfy_topic):
+    """Untracking forgets pending notifications too, so a manga you stopped
+    tracking can't still buzz your phone on a later sweep (the LEFT-JOIN orphan).
+    """
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
+
+    # A new chapter is detected, but the push fails → notification left pending.
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    push = respx.post(NTFY_URL).mock(return_value=httpx.Response(500))
+    client.post("/check", headers=check_auth)
+    assert push.call_count == 1                        # tried once, failed
+
+    # Untrack it — the DELETE reports the pending notification it cleaned up.
+    resp = client.delete(f"/track/{TRACKED_MANGA_ID}")
+    assert resp.json()["notifications_removed"] == 1
+
+    # ntfy recovers, but there's nothing left to deliver for the gone manga.
+    push.mock(return_value=httpx.Response(200, json={}))
+    client.post("/check", headers=check_auth)
+    assert push.call_count == 1                        # no orphan push fired
+
+
 # --- liveness vs readiness -------------------------------------------------
 
 
