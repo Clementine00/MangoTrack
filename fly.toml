@@ -10,6 +10,7 @@ primary_region = 'sjc'
 # not the container's throwaway filesystem. Not secret, so plain [env] is fine.
 [env]
   DB_PATH = '/data/mangotrack.db'
+  SENTRY_ENVIRONMENT = 'production'
 
 [build]
   dockerfile = 'Dockerfile'

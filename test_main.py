@@ -18,6 +18,7 @@ import uuid
 import httpx
 import pytest
 import respx
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import main
@@ -670,3 +671,31 @@ def test_response_carries_request_id_header():
     # A second request gets a different id (ids are per-request, not constant).
     other = client.get("/health").headers["X-Request-ID"]
     assert other != request_id
+
+
+# --- Sentry error filtering ------------------------------------------------
+#
+# before_send is the hook that decides what reaches Sentry. We test it directly
+# (no live SDK) by handing it the (event, hint) pair Sentry would pass: hint
+# carries exc_info = (type, value, traceback) for exception events.
+
+
+def test_before_send_drops_deliberate_http_exceptions():
+    """An HTTPException we raise on purpose (404/401/502/...) is handled control
+    flow, not a bug — the filter discards it so it never pages anyone."""
+    event = {"event_id": "x"}
+    hint = {"exc_info": (HTTPException, HTTPException(status_code=502), None)}
+    assert main.before_send(event, hint) is None
+
+
+def test_before_send_keeps_unexpected_exceptions():
+    """A genuinely unhandled exception (the real 500s) passes through to Sentry."""
+    event = {"event_id": "x"}
+    hint = {"exc_info": (RuntimeError, RuntimeError("boom"), None)}
+    assert main.before_send(event, hint) is event
+
+
+def test_before_send_keeps_events_without_exc_info():
+    """Non-exception events (no exc_info in the hint) are kept as-is."""
+    event = {"event_id": "x"}
+    assert main.before_send(event, {}) is event

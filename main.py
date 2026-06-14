@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import httpx
+import sentry_sdk
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
@@ -126,6 +127,35 @@ async def lifespan(app: FastAPI):
     init_db()         # runs once, when the app boots
     yield             # app serves requests here
     # (nothing to tear down for SQLite)
+
+
+# --- Sentry (error tracking) -----------------------------------------------
+def before_send(event, hint):
+    """Drop events for HTTPExceptions we raise on purpose (404/401/502/...).
+
+    Those are handled control flow, not bugs: a typo'd manga id or a MangaDex
+    outage is an expected outcome we already signal with a status code. Only
+    genuinely unhandled exceptions — the real 500s — should reach Sentry, so a
+    title-not-found never pages anyone. hint["exc_info"] is (type, value, tb).
+    """
+    exc_info = hint.get("exc_info")
+    if exc_info and isinstance(exc_info[1], HTTPException):
+        return None
+    return event
+
+
+# DSN unset (local/tests) -> the SDK goes no-op and ships nothing, the same
+# fail-closed pattern as NTFY_TOPIC/CHECK_TOKEN. The FastAPI/Starlette
+# integration auto-enables because those packages are installed, so unhandled
+# exceptions are captured without decorating any endpoint. Init must run before
+# the FastAPI app is constructed so that integration can patch it.
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN", ""),
+    environment=os.getenv("SENTRY_ENVIRONMENT", "development"),
+    release=os.getenv("GIT_SHA", "dev"),
+    traces_sample_rate=0.0,          # errors only; tracing is a later (metrics) concern
+    before_send=before_send,
+)
 
 
 app = FastAPI(title="MangoTrack", lifespan=lifespan)

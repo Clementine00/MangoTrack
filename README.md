@@ -37,6 +37,23 @@ chapter, and a tap-through link to MangaDex.
   destination. Both are Fly secrets — unset means the feature does nothing rather
   than misfiring, so local/test runs never push.
 
+## Error tracking
+
+Unhandled exceptions are reported to [Sentry](https://sentry.io) with full stack
+traces and the request that triggered them, so a crash alerts you instead of
+scrolling past in the logs.
+
+- **Auto-captured.** The Sentry FastAPI integration hooks the app, so genuine
+  bugs (the real `500`s) are reported without instrumenting any endpoint.
+- **Deliberate errors are filtered.** The `HTTPException`s we raise on purpose —
+  `404` for an unknown id, `502` when MangaDex is down, `401` on a bad token — are
+  handled control flow, not bugs. A `before_send` hook drops them so they never page.
+- **Tagged for triage.** Every event carries its `environment` (`production` vs
+  `development`) and `release` (the git commit), pinning an error to the exact
+  deployed code.
+- **Fail-closed config.** `SENTRY_DSN` is a Fly secret; unset (local/test) means
+  the SDK no-ops and ships nothing.
+
 ## Local development
 
 Uses a stdlib virtual environment (`.venv/`, gitignored). Python 3.13.
