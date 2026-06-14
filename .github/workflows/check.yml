@@ -12,8 +12,26 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Dead-man's switch (healthchecks.io). The app can't alert on its own cron
+      # dying — a dead cron never wakes it — so the *workflow* reports liveness to
+      # an external service that pages us when the pings stop. Fail-closed like
+      # the app's other secrets: unset -> the ping steps skip and the sweep still
+      # runs, so a fork/PR without the secret doesn't error.
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
     steps:
       - name: Trigger /check
         run: |
           curl -fsS -X POST https://mangotrack.fly.dev/check \
             -H "Authorization: Bearer ${{ secrets.CHECK_TOKEN }}"
+
+      # Sweep succeeded -> ping the snitch so it knows we're alive this cycle.
+      - name: Ping dead-man's switch (success)
+        if: success() && env.HEALTHCHECK_URL != ''
+        run: curl -fsS -m 10 --retry 5 "$HEALTHCHECK_URL"
+
+      # Sweep failed (bad token, app down, MangaDex 5xx) -> ping /fail so the
+      # snitch records a failure now instead of waiting for pings to lapse.
+      - name: Ping dead-man's switch (failure)
+        if: failure() && env.HEALTHCHECK_URL != ''
+        run: curl -fsS -m 10 --retry 5 "$HEALTHCHECK_URL/fail"
