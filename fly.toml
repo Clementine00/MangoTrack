@@ -15,6 +15,13 @@ primary_region = 'sjc'
 [build]
   dockerfile = 'Dockerfile'
 
+# Fly's managed Prometheus scrapes this on the private network while the machine
+# is awake. /metrics reads cumulative counts from the DB, so the values survive
+# scale-to-zero — gaps between wakes, but every sample is the correct total.
+[metrics]
+  port = 8080
+  path = '/metrics'
+
 [http_service]
   internal_port = 8080
   force_https = true

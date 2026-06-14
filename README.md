@@ -19,6 +19,7 @@ project for learning devops.
 | `GET /track`   | List everything currently tracked. |
 | `DELETE /track/{manga_id}` | Stop tracking a manga and forget its pending notifications. `404` if it wasn't tracked. |
 | `POST /check`  | Sweep every tracked manga for new chapters, queue a notification per new chapter, and deliver pending ones. Secret-gated (`Authorization: Bearer <token>`), fail-closed. See below. |
+| `GET /metrics` | Prometheus exposition of domain counts (chapters detected, notifications delivered/pending). Scraped by Fly's managed Prometheus. See below. |
 | `GET /docs`    | Auto-generated interactive API docs (Swagger UI). |
 
 ## Notifications
@@ -53,6 +54,33 @@ scrolling past in the logs.
   deployed code.
 - **Fail-closed config.** `SENTRY_DSN` is a Fly secret; unset (local/test) means
   the SDK no-ops and ships nothing.
+
+## Metrics
+
+`GET /metrics` exposes domain counts in Prometheus text format, scraped by Fly's
+managed Prometheus (see the `[metrics]` block in `fly.toml`) and viewable in
+Fly's Grafana (`fly dashboard metrics`):
+
+- `mangotrack_chapters_detected_total` (counter) — new chapters detected across all sweeps.
+- `mangotrack_notifications_delivered_total` (counter) — notifications pushed to ntfy successfully.
+- `mangotrack_notifications_pending` (gauge) — notifications awaiting delivery; **climbs when pushes are failing**, so it's the delivery-health signal.
+- `mangotrack_tracked_manga` (gauge) — how many manga are currently tracked.
+- `mangotrack_last_check_timestamp_seconds` (gauge) — Unix time of the most recent sweep. **The dead-man's switch for the external cron:** alert when it stops advancing (`time() - mangotrack_last_check_timestamp_seconds`), since a broken cron means no wake, no sweep, and silently no notifications.
+- `mangotrack_oldest_pending_notification_timestamp_seconds` (gauge) — when the oldest still-undelivered notification was detected; how long delivery has been stuck.
+
+The two timestamp metrics are emitted as **absolute Unix time, not a pre-computed
+age** — a scraped "seconds since" would freeze while the machine sleeps, whereas a
+timestamp lets the query compute true elapsed time. They're omitted entirely when
+there's no row yet, so the series is absent rather than a misleading zero.
+
+- **Read from the DB at scrape time, not held in memory.** This is what makes
+  them survive [scale-to-zero](#deployment--cicd): the counts live on the
+  persistent volume, so a scrape after the machine wakes reports the correct
+  running total instead of a counter that reset to zero while it slept. Between
+  wakes you get gaps in the graph, but every sample is the true cumulative value.
+- **Hand-rolled exposition.** The text format is trivial, so `/metrics` builds it
+  directly (no `prometheus_client` dependency), the same way logging hand-rolls
+  its JSON formatter.
 
 ## Local development
 

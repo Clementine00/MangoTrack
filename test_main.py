@@ -699,3 +699,83 @@ def test_before_send_keeps_events_without_exc_info():
     """Non-exception events (no exc_info in the hint) are kept as-is."""
     event = {"event_id": "x"}
     assert main.before_send(event, {}) is event
+
+
+# --- metrics (Prometheus exposition) ---------------------------------------
+
+
+def test_metrics_exposition_format(db):
+    """/metrics returns Prometheus text — HELP/TYPE lines and zeroed counts."""
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    body = resp.text
+    assert "# TYPE mangotrack_chapters_detected_total counter" in body
+    assert "# TYPE mangotrack_notifications_pending gauge" in body
+    assert "mangotrack_chapters_detected_total 0" in body      # nothing detected yet
+    assert "mangotrack_notifications_pending 0" in body
+    assert "mangotrack_tracked_manga 0" in body                # nothing tracked yet
+    # Timestamps are omitted (not zeroed) when there's no row, so the series is
+    # simply absent rather than a misleading epoch-0.
+    assert "mangotrack_last_check_timestamp_seconds" not in body
+    assert "mangotrack_oldest_pending_notification_timestamp_seconds" not in body
+
+
+@respx.mock
+def test_metrics_counts_detected_and_delivered(db, check_auth, ntfy_topic):
+    """A detected + delivered chapter bumps both counters; pending stays 0."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")          # baseline = 42
+
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.post(NTFY_URL).mock(return_value=httpx.Response(200, json={}))
+    client.post("/check", headers=check_auth)          # detect 50 and deliver it
+
+    body = client.get("/metrics").text
+    assert "mangotrack_chapters_detected_total 1" in body
+    assert "mangotrack_notifications_delivered_total 1" in body
+    assert "mangotrack_notifications_pending 0" in body
+    assert "mangotrack_tracked_manga 1" in body
+    assert "mangotrack_last_check_timestamp_seconds " in body   # a sweep ran, so it's present
+    assert "mangotrack_oldest_pending_notification_timestamp_seconds" not in body  # nothing pending
+
+
+@respx.mock
+def test_metrics_pending_rises_on_delivery_failure(db, check_auth, ntfy_topic):
+    """A failed push leaves the row pending → the gauge climbs (the errors signal)."""
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "42", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.get(MANGA_URL).mock(return_value=_manga_title_response({"en": "Hitoner"}))
+    client.post(f"/track/{TRACKED_MANGA_ID}")
+
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"attributes": {"chapter": "50", "title": None, "publishAt": None}}]},
+        )
+    )
+    respx.post(NTFY_URL).mock(return_value=httpx.Response(500))   # ntfy is down
+    client.post("/check", headers=check_auth)
+
+    body = client.get("/metrics").text
+    assert "mangotrack_chapters_detected_total 1" in body
+    assert "mangotrack_notifications_delivered_total 0" in body
+    assert "mangotrack_notifications_pending 1" in body
+    # A push failed → a row is stuck pending, so the oldest-pending series appears.
+    assert "mangotrack_oldest_pending_notification_timestamp_seconds " in body
