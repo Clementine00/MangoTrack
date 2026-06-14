@@ -25,7 +25,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import sentry_sdk
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from logging_setup import request_id_var, setup_logging
@@ -180,7 +180,7 @@ async def log_requests(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id   # let clients correlate too
         return response
     finally:
-        if request.url.path not in ("/health", "/ready"):
+        if request.url.path not in ("/health", "/ready", "/metrics"):
             duration_ms = round((time.perf_counter() - start) * 1000, 1)
             log.info(
                 "request",
@@ -253,6 +253,74 @@ def version() -> dict[str, str]:
         "commit": sha[:7],
         "url": f"{GITHUB_REPO}/commit/{sha}",
     }
+
+
+# --- metrics ----------------------------------------------------------------
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus exposition of domain counts, read from the DB at scrape time.
+
+    Hand-rolled like JsonFormatter — the text format is trivial and dodges a
+    dependency. Reading from the persistent DB is what makes these survive
+    scale-to-zero: the values live on the volume, not in memory, so every scrape
+    after a wake reports the correct running total instead of a counter that
+    reset to zero when the machine last slept. Plain `def` (not async) because
+    the SQLite reads block — FastAPI runs it in a threadpool, like /track.
+
+    notifications_pending is the "delivery errors" signal: a failed push leaves
+    its row at delivered=0, so the gauge climbs and stays up until ntfy recovers.
+
+    The time-based metrics are emitted as absolute Unix timestamps, not as a
+    pre-computed age: a scraped "seconds since X" would freeze at its last value
+    while the machine sleeps, whereas a timestamp lets the query compute true
+    elapsed time (`time() - <ts>`). last_check_timestamp is the dead-man's switch
+    for the external GitHub-Actions cron — alert when it stops advancing, since a
+    broken cron means no wake, no sweep, and silently no notifications. Both
+    timestamps are omitted when there's no row yet, so the series is simply absent
+    rather than a misleading zero.
+    """
+    with get_db() as conn:
+        detected = conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+        delivered = conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE delivered = 1"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE delivered = 0"
+        ).fetchone()[0]
+        tracked = conn.execute("SELECT COUNT(*) FROM tracked_manga").fetchone()[0]
+        last_check = conn.execute("SELECT MAX(last_checked_at) FROM tracked_manga").fetchone()[0]
+        oldest_pending = conn.execute(
+            "SELECT MIN(detected_at) FROM notifications WHERE delivered = 0"
+        ).fetchone()[0]
+
+    lines = [
+        "# HELP mangotrack_chapters_detected_total New chapters detected across all sweeps.",
+        "# TYPE mangotrack_chapters_detected_total counter",
+        f"mangotrack_chapters_detected_total {detected}",
+        "# HELP mangotrack_notifications_delivered_total Notifications pushed to ntfy successfully.",
+        "# TYPE mangotrack_notifications_delivered_total counter",
+        f"mangotrack_notifications_delivered_total {delivered}",
+        "# HELP mangotrack_notifications_pending Notifications awaiting delivery (climbs when pushes fail).",
+        "# TYPE mangotrack_notifications_pending gauge",
+        f"mangotrack_notifications_pending {pending}",
+        "# HELP mangotrack_tracked_manga Manga currently being tracked.",
+        "# TYPE mangotrack_tracked_manga gauge",
+        f"mangotrack_tracked_manga {tracked}",
+    ]
+    if last_check is not None:
+        lines += [
+            "# HELP mangotrack_last_check_timestamp_seconds Unix time of the most recent sweep.",
+            "# TYPE mangotrack_last_check_timestamp_seconds gauge",
+            f"mangotrack_last_check_timestamp_seconds {datetime.fromisoformat(last_check).timestamp()}",
+        ]
+    if oldest_pending is not None:
+        lines += [
+            "# HELP mangotrack_oldest_pending_notification_timestamp_seconds Unix time the oldest still-undelivered notification was detected.",
+            "# TYPE mangotrack_oldest_pending_notification_timestamp_seconds gauge",
+            f"mangotrack_oldest_pending_notification_timestamp_seconds {datetime.fromisoformat(oldest_pending).timestamp()}",
+        ]
+    body = "\n".join(lines) + "\n"
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 # --- latest (read) ----------------------------------------------------------
