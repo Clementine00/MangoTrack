@@ -255,6 +255,18 @@ def version() -> dict[str, str]:
     }
 
 
+# --- TEMPORARY: Sentry prod verification — REMOVE after confirming -----------
+@app.get("/boom")
+def boom() -> dict[str, str]:
+    """Throwaway: raise a genuine unhandled exception so we can confirm Sentry
+    captures real 500s in PROD (auto-captured by the FastAPI integration, tagged
+    environment=production + release=<commit>). A RuntimeError, NOT an
+    HTTPException — an HTTPException would be dropped by before_send. Delete this
+    route once the prod event has been verified in the Sentry dashboard.
+    """
+    raise RuntimeError("boom — sentry prod verification")
+
+
 # --- metrics ----------------------------------------------------------------
 @app.get("/metrics")
 def metrics() -> Response:
